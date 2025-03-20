@@ -2,13 +2,22 @@ import sys
 import sqlite3
 import hashlib
 import json
+import cv2
+import mediapipe as mp
+import numpy as np
+import time
 from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QWidget, QLabel, QPushButton, QVBoxLayout, QHBoxLayout, QMessageBox,
     QStackedWidget, QListWidget, QListWidgetItem, QLineEdit, QFormLayout, QDialog, QComboBox,
-    QTextEdit, QGridLayout, QRadioButton, QButtonGroup, QSpinBox, QScrollArea
+    QTextEdit, QGridLayout, QRadioButton, QButtonGroup, QSpinBox, QScrollArea, QFrame ,QTabWidget
 )
-from PyQt5.QtGui import QFont
-from PyQt5.QtCore import Qt
+from PyQt5.QtGui import QFont, QIcon, QImage, QPixmap
+from PyQt5.QtCore import Qt, QTimer, pyqtSignal, QThread
+
+# Initialize MediaPipe Hands
+mp_hands = mp.solutions.hands
+mp_drawing = mp.solutions.drawing_utils
+hands = mp_hands.Hands(min_detection_confidence=0.7, min_tracking_confidence=0.7)
 
 # Database Setup
 def initialize_database():
@@ -66,10 +75,118 @@ def get_db_connection():
 def hash_password(password):
     return hashlib.sha256(password.encode()).hexdigest()
 
+# Video processing thread class
+class VideoThread(QThread):
+    update_frame = pyqtSignal(QImage)
+    gesture_detected = pyqtSignal(int)
+    
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.running = False
+        self.cap = None
+        self.gesture_cooldown = False
+        self.last_gesture_time = 0
+        self.cooldown_duration = 2  # seconds
+    
+    def run(self):
+        self.running = True
+        self.cap = cv2.VideoCapture(0)
+        
+        with mp_hands.Hands(
+            min_detection_confidence=0.7,
+            min_tracking_confidence=0.5) as hands:
+            
+            while self.running:
+                ret, frame = self.cap.read()
+                if not ret:
+                    break
+                
+                # Flip the frame horizontally for a later selfie-view display
+                frame = cv2.flip(frame, 1)
+                
+                # Convert the BGR image to RGB
+                rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                
+                # Process the frame with MediaPipe Hands
+                results = hands.process(rgb_frame)
+                
+                # Draw hand landmarks on the frame
+                if results.multi_hand_landmarks:
+                    for hand_landmarks in results.multi_hand_landmarks:
+                        mp_drawing.draw_landmarks(
+                            frame, hand_landmarks, mp_hands.HAND_CONNECTIONS)
+                        
+                        # Check if we can detect a gesture now
+                        current_time = time.time()
+                        if not self.gesture_cooldown or current_time - self.last_gesture_time > self.cooldown_duration:
+                            # Get gesture
+                            gesture = self.detect_gesture(hand_landmarks)
+                            if gesture is not None:
+                                self.gesture_detected.emit(gesture)
+                                self.gesture_cooldown = True
+                                self.last_gesture_time = current_time
+                
+                # Add help text
+                cv2.putText(frame, "Gestures: 1 finger (A), 2 fingers (B), 3 fingers (C), 4 fingers (D)", 
+                            (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+                
+                # Convert to Qt format
+                h, w, ch = frame.shape
+                qt_image = QImage(frame.data, w, h, ch * w, QImage.Format_RGB888)
+                
+                # Emit signal
+                self.update_frame.emit(qt_image.rgbSwapped())
+                
+                # Sleep to reduce CPU usage
+                self.msleep(30)
+    
+    def detect_gesture(self, hand_landmarks):
+        # Count extended fingers
+        extended_fingers = 0
+        
+        # Get finger tip and pip (middle joint) landmarks
+        tips = [hand_landmarks.landmark[mp_hands.HandLandmark.THUMB_TIP],
+                hand_landmarks.landmark[mp_hands.HandLandmark.INDEX_FINGER_TIP],
+                hand_landmarks.landmark[mp_hands.HandLandmark.MIDDLE_FINGER_TIP],
+                hand_landmarks.landmark[mp_hands.HandLandmark.RING_FINGER_TIP],
+                hand_landmarks.landmark[mp_hands.HandLandmark.PINKY_TIP]]
+        
+        pips = [hand_landmarks.landmark[mp_hands.HandLandmark.THUMB_IP],
+                hand_landmarks.landmark[mp_hands.HandLandmark.INDEX_FINGER_PIP],
+                hand_landmarks.landmark[mp_hands.HandLandmark.MIDDLE_FINGER_PIP],
+                hand_landmarks.landmark[mp_hands.HandLandmark.RING_FINGER_PIP],
+                hand_landmarks.landmark[mp_hands.HandLandmark.PINKY_PIP]]
+        
+        # Get wrist landmark
+        wrist = hand_landmarks.landmark[mp_hands.HandLandmark.WRIST]
+        
+        # Check each finger (simplified for demo - just checking if tip is above pip on y-axis)
+        # For the thumb, check if it's to the side (x-axis)
+        for i in range(5):
+            if i == 0:  # Thumb
+                if tips[i].x < pips[i].x:  # For right hand
+                    extended_fingers += 1
+            else:  # Other fingers
+                if tips[i].y < pips[i].y:
+                    extended_fingers += 1
+        
+        # Map to answer choices (1-4 fingers = options A-D)
+        if 1 <= extended_fingers <= 4:
+            return extended_fingers - 1  # Return 0 for A, 1 for B, etc.
+        else:
+            return None  # No recognized gesture
+    
+    def stop(self):
+        self.running = False
+        if self.cap:
+            self.cap.release()
+        self.wait()
+
 class LoginDialog(QDialog):
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setWindowTitle("Login")
+        self.setWindowIcon(QIcon("icon.png"))
         self.resize(300, 200)
         layout = QVBoxLayout()
 
@@ -155,6 +272,7 @@ class CreateQuizDialog(QDialog):
         self.questions = []
         
         self.setWindowTitle("Create Quiz")
+        self.setWindowIcon(QIcon("icon.png"))
         self.resize(600, 400)
         
         layout = QVBoxLayout()
@@ -294,6 +412,266 @@ class CreateQuizDialog(QDialog):
         finally:
             conn.close()
 
+class GestureQuizDialog(QDialog):
+    def __init__(self, student_id, quiz_id, quiz_title, parent=None):
+        super().__init__(parent)
+        self.student_id = student_id
+        self.quiz_id = quiz_id
+        self.quiz_title = quiz_title
+        self.questions = []
+        self.current_question_idx = 0
+        self.user_answers = {}
+        
+        # Get questions
+        self.load_questions()
+        
+        # Set up UI
+        self.setWindowTitle(f"Gesture Quiz: {quiz_title}")
+        self.resize(1000, 700)
+        
+        main_layout = QHBoxLayout()
+        
+        # Left side - quiz content
+        self.quiz_layout = QVBoxLayout()
+        
+        # Quiz title
+        title_label = QLabel(quiz_title)
+        title_label.setFont(QFont("Arial", 16, QFont.Bold))
+        self.quiz_layout.addWidget(title_label)
+        
+        # Question display
+        self.question_frame = QFrame()
+        self.question_frame.setFrameShape(QFrame.StyledPanel)
+        self.question_frame.setMinimumHeight(300)
+        self.question_layout = QVBoxLayout(self.question_frame)
+        
+        # Question text
+        self.question_label = QLabel()
+        self.question_label.setFont(QFont("Arial", 12))
+        self.question_label.setWordWrap(True)
+        self.question_layout.addWidget(self.question_label)
+        
+        # Options
+        self.option_buttons = []
+        self.option_layout = QVBoxLayout()
+        for i in range(4):
+            option_btn = QRadioButton()
+            option_btn.setFont(QFont("Arial", 11))
+            self.option_buttons.append(option_btn)
+            self.option_layout.addWidget(option_btn)
+        
+        self.question_layout.addLayout(self.option_layout)
+        self.quiz_layout.addWidget(self.question_frame)
+        
+        # Navigation buttons
+        nav_layout = QHBoxLayout()
+        
+        self.prev_button = QPushButton("Previous")
+        self.prev_button.clicked.connect(self.previous_question)
+        nav_layout.addWidget(self.prev_button)
+        
+        self.question_counter = QLabel("Question 1 of X")
+        nav_layout.addWidget(self.question_counter)
+        
+        self.next_button = QPushButton("Next")
+        self.next_button.clicked.connect(self.next_question)
+        nav_layout.addWidget(self.next_button)
+        
+        self.submit_button = QPushButton("Submit Quiz")
+        self.submit_button.clicked.connect(self.submit_quiz)
+        nav_layout.addWidget(self.submit_button)
+        
+        self.quiz_layout.addLayout(nav_layout)
+        
+        # Gesture instructions
+        gesture_info = QLabel(
+            "Use hand gestures to select answers:\n"
+            "• 1 finger (index) = Option A\n"
+            "• 2 fingers (index + middle) = Option B\n"
+            "• 3 fingers = Option C\n"
+            "• 4 fingers = Option D"
+        )
+        gesture_info.setStyleSheet("background-color: #f0f0f0; padding: 10px; border-radius: 5px;")
+        self.quiz_layout.addWidget(gesture_info)
+        
+        main_layout.addLayout(self.quiz_layout, 2)
+        
+        # Right side - camera view
+        camera_layout = QVBoxLayout()
+        
+        camera_label = QLabel("Hand Gesture Camera")
+        camera_label.setFont(QFont("Arial", 14, QFont.Bold))
+        camera_layout.addWidget(camera_label)
+        
+        self.camera_view = QLabel()
+        self.camera_view.setMinimumSize(400, 300)
+        self.camera_view.setAlignment(Qt.AlignCenter)
+        self.camera_view.setStyleSheet("border: 2px solid #888; background-color: #000;")
+        camera_layout.addWidget(self.camera_view)
+        
+        self.gesture_status = QLabel("Waiting for gesture...")
+        self.gesture_status.setAlignment(Qt.AlignCenter)
+        self.gesture_status.setStyleSheet("font-size: 14px; font-weight: bold; padding: 5px;")
+        camera_layout.addWidget(self.gesture_status)
+        
+        main_layout.addLayout(camera_layout, 1)
+        
+        self.setLayout(main_layout)
+        
+        # Initialize video capture thread
+        self.video_thread = VideoThread()
+        self.video_thread.update_frame.connect(self.update_camera_view)
+        self.video_thread.gesture_detected.connect(self.handle_gesture)
+        self.video_thread.start()
+        
+        # Display first question
+        self.display_question(0)
+        
+    def load_questions(self):
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        
+        cursor.execute("SELECT id, question_text, options, correct_answer FROM questions WHERE quiz_id = ?", (self.quiz_id,))
+        self.questions = cursor.fetchall()
+        
+        conn.close()
+    
+    def display_question(self, idx):
+        if not self.questions or idx < 0 or idx >= len(self.questions):
+            return
+        
+        q_id, question_text, options_json, correct_answer = self.questions[idx]
+        options = json.loads(options_json)
+        
+        self.question_label.setText(f"Question {idx+1}: {question_text}")
+        
+        for i, opt in enumerate(self.option_buttons):
+            if i < len(options):
+                opt.setText(f"{chr(65+i)}. {options[i]}")
+                opt.setVisible(True)
+                
+                # Check if user already answered this question
+                if q_id in self.user_answers and self.user_answers[q_id] == i:
+                    opt.setChecked(True)
+                else:
+                    opt.setChecked(False)
+            else:
+                opt.setVisible(False)
+        
+        self.question_counter.setText(f"Question {idx+1} of {len(self.questions)}")
+        
+        # Update navigation buttons
+        self.prev_button.setEnabled(idx > 0)
+        self.next_button.setEnabled(idx < len(self.questions) - 1)
+        self.submit_button.setEnabled(True)
+        
+        # Update current question index
+        self.current_question_idx = idx
+    
+    def next_question(self):
+        # Save current answer if selected
+        self.save_current_answer()
+        
+        # Move to next question
+        if self.current_question_idx < len(self.questions) - 1:
+            self.display_question(self.current_question_idx + 1)
+    
+    def previous_question(self):
+        # Save current answer if selected
+        self.save_current_answer()
+        
+        # Move to previous question
+        if self.current_question_idx > 0:
+            self.display_question(self.current_question_idx - 1)
+    
+    def save_current_answer(self):
+        if not self.questions:
+            return
+        
+        q_id = self.questions[self.current_question_idx][0]
+        
+        # Find selected option
+        for i, opt in enumerate(self.option_buttons):
+            if opt.isChecked():
+                self.user_answers[q_id] = i
+                break
+    
+    def submit_quiz(self):
+        # Save final answer
+        self.save_current_answer()
+        
+        # Check if all questions are answered
+        if len(self.user_answers) < len(self.questions):
+            reply = QMessageBox.question(self, "Incomplete Quiz", 
+                                         f"You've only answered {len(self.user_answers)} of {len(self.questions)} questions. "
+                                         "Do you want to submit anyway?",
+                                         QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
+            if reply == QMessageBox.No:
+                return
+        
+        # Calculate score
+        score = 0
+        for q_id, _, _, correct_answer in self.questions:
+            if q_id in self.user_answers and self.user_answers[q_id] == correct_answer:
+                score += 1
+        
+        # Save result to database
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        
+        cursor.execute(
+            "INSERT INTO results (student_id, quiz_id, score, total_questions) VALUES (?, ?, ?, ?)",
+            (self.student_id, self.quiz_id, score, len(self.questions))
+        )
+        
+        conn.commit()
+        conn.close()
+        
+        # Stop video thread
+        self.video_thread.stop()
+        
+        # Show result
+        QMessageBox.information(self, "Quiz Result", 
+                                f"Your score: {score}/{len(self.questions)} ({score/len(self.questions)*100:.1f}%)")
+        
+        self.accept()
+    
+    def update_camera_view(self, image):
+        self.camera_view.setPixmap(QPixmap.fromImage(image).scaled(
+            self.camera_view.width(), self.camera_view.height(), 
+            Qt.KeepAspectRatio, Qt.SmoothTransformation))
+    
+    def handle_gesture(self, gesture_id):
+        # Map gesture to an option (0-3)
+        option_texts = ["A (Index finger)", "B (Two fingers)", "C (Three fingers)", "D (Four fingers)"]
+        
+        if 0 <= gesture_id <= 3:
+            self.gesture_status.setText(f"Detected: Option {option_texts[gesture_id]}")
+            self.gesture_status.setStyleSheet("font-size: 14px; font-weight: bold; color: green; padding: 5px;")
+            
+            # Select the corresponding radio button
+            self.option_buttons[gesture_id].setChecked(True)
+            
+            # Save the answer
+            self.save_current_answer()
+            
+            # Optional: Auto-advance to next question after a short delay
+            QTimer.singleShot(1500, lambda: self.auto_advance())
+    
+    def auto_advance(self):
+        # Auto-advance to next question if there is one
+        if self.current_question_idx < len(self.questions) - 1:
+            self.next_question()
+        else:
+            # Flash the submit button if on last question
+            self.submit_button.setStyleSheet("background-color: #ff9900;")
+            QTimer.singleShot(1000, lambda: self.submit_button.setStyleSheet(""))
+    
+    def closeEvent(self, event):
+        # Stop video thread when dialog closes
+        self.video_thread.stop()
+        event.accept()
+
 class QuizWidget(QWidget):
     def __init__(self, user_id, user_role, parent=None):
         super().__init__(parent)
@@ -314,10 +692,21 @@ class QuizWidget(QWidget):
         self.quiz_list.itemDoubleClicked.connect(self.on_quiz_selected)
         layout.addWidget(self.quiz_list)
         
+        # Buttons layout
+        button_layout = QHBoxLayout()
+        
         # Refresh button
         self.refresh_button = QPushButton("Refresh Quizzes")
         self.refresh_button.clicked.connect(self.load_quizzes)
-        layout.addWidget(self.refresh_button)
+        button_layout.addWidget(self.refresh_button)
+        
+        # Create quiz button (teachers only)
+        if self.user_role == "teacher":
+            self.create_quiz_button = QPushButton("Create New Quiz")
+            self.create_quiz_button.clicked.connect(self.create_quiz)
+            button_layout.addWidget(self.create_quiz_button)
+        
+        layout.addLayout(button_layout)
         
         self.setLayout(layout)
         self.load_quizzes()
@@ -352,91 +741,33 @@ class QuizWidget(QWidget):
         for quiz_id, title, question_count in quizzes:
             item = QListWidgetItem(f"{title} ({question_count} questions)")
             item.setData(Qt.UserRole, quiz_id)
+            item.setData(Qt.UserRole + 1, title)
             self.quiz_list.addItem(item)
     
     def on_quiz_selected(self, item):
         quiz_id = item.data(Qt.UserRole)
+        quiz_title = item.data(Qt.UserRole + 1)
         
         if self.user_role == "teacher":
             # Teachers can view quiz details
             self.show_quiz_details(quiz_id)
         else:
-            # Students can take the quiz
-            self.take_quiz(quiz_id)
+            # Students can take the quiz with gestures
+            reply = QMessageBox.question(self, "Quiz Mode", 
+                                       "Choose quiz mode:\n\nYes: Use gesture recognition\nNo: Standard mode",
+                                       QMessageBox.Yes | QMessageBox.No)
+            
+            if reply == QMessageBox.Yes:
+                self.take_gesture_quiz(quiz_id, quiz_title)
+            else:
+                self.take_quiz(quiz_id)
     
-    def show_quiz_details(self, quiz_id):
-        conn = get_db_connection()
-        cursor = conn.cursor()
-        
-        cursor.execute("SELECT title FROM quizzes WHERE id = ?", (quiz_id,))
-        quiz_title = cursor.fetchone()[0]
-        
-        cursor.execute("SELECT id, question_text, options, correct_answer FROM questions WHERE quiz_id = ?", (quiz_id,))
-        questions = cursor.fetchall()
-        
-        conn.close()
-        
-        # Display quiz details in a new dialog
-        dialog = QDialog(self)
-        dialog.setWindowTitle(f"Quiz Details: {quiz_title}")
-        dialog.resize(600, 400)
-        
-        layout = QVBoxLayout()
-        
-        # Add quiz title
-        title_label = QLabel(quiz_title)
-        title_label.setFont(QFont("Arial", 14, QFont.Bold))
-        layout.addWidget(title_label)
-        
-        # Create scroll area for questions
-        scroll = QScrollArea()
-        scroll.setWidgetResizable(True)
-        scroll_content = QWidget()
-        questions_layout = QVBoxLayout(scroll_content)
-        
-        for q_id, question_text, options_json, correct_answer in questions:
-            options = json.loads(options_json)
-            
-            question_group = QWidget()
-            q_layout = QVBoxLayout(question_group)
-            
-            q_layout.addWidget(QLabel(f"Question: {question_text}"))
-            
-            for i, option in enumerate(options):
-                option_label = QLabel(f"{i}: {option}")
-                if i == correct_answer:
-                    option_label.setStyleSheet("color: green; font-weight: bold;")
-                q_layout.addWidget(option_label)
-            
-            questions_layout.addWidget(question_group)
-            questions_layout.addWidget(QLabel(""))  # Spacer
-        
-        scroll.setWidget(scroll_content)
-        layout.addWidget(scroll)
-        
-        close_button = QPushButton("Close")
-        close_button.clicked.connect(dialog.accept)
-        layout.addWidget(close_button)
-        
-        dialog.setLayout(layout)
-        dialog.exec_()
+    def create_quiz(self):
+        dialog = CreateQuizDialog(self.user_id, self)
+        if dialog.exec_() == QDialog.Accepted:
+            self.load_quizzes()
     
-    def take_quiz(self, quiz_id):
-        conn = get_db_connection()
-        cursor = conn.cursor()
-        
-        cursor.execute("SELECT title FROM quizzes WHERE id = ?", (quiz_id,))
-        quiz_title = cursor.fetchone()[0]
-        
-        cursor.execute("SELECT id, question_text, options, correct_answer FROM questions WHERE quiz_id = ?", (quiz_id,))
-        questions = cursor.fetchall()
-        
-        conn.close()
-        
-        if not questions:
-            QMessageBox.warning(self, "Error", "This quiz has no questions")
-            return
-        
+    def take_gesture_quiz(self, quiz_id, quiz_title):
         # Check if student has already taken this quiz
         conn = get_db_connection()
         cursor = conn.cursor()
@@ -446,94 +777,103 @@ class QuizWidget(QWidget):
         conn.close()
         
         if existing_result:
-            reply = QMessageBox.question(self, "Quiz Already Taken", 
-                                        "You have already taken this quiz. Do you want to take it again?",
-                                        QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
+            reply = QMessageBox.question(self, "Retake Quiz", 
+                                         "You have already taken this quiz. Would you like to take it again?",
+                                         QMessageBox.Yes | QMessageBox.No)
             if reply == QMessageBox.No:
                 return
         
-        # Create quiz taking dialog
-        dialog = QDialog(self)
-        dialog.setWindowTitle(f"Taking Quiz: {quiz_title}")
-        dialog.resize(600, 500)
-        
-        layout = QVBoxLayout()
-        
-        # Add quiz title
-        title_label = QLabel(quiz_title)
-        title_label.setFont(QFont("Arial", 14, QFont.Bold))
-        layout.addWidget(title_label)
-        
-        # Create scroll area for questions
-        scroll = QScrollArea()
-        scroll.setWidgetResizable(True)
-        scroll_content = QWidget()
-        questions_layout = QVBoxLayout(scroll_content)
-        
-        # Track user answers
-        user_answers = {}
-        
-        for q_id, question_text, options_json, correct_answer in questions:
-            options = json.loads(options_json)
-            
-            question_group = QWidget()
-            q_layout = QVBoxLayout(question_group)
-            
-            q_layout.addWidget(QLabel(f"Question: {question_text}"))
-            
-            # Create radio button group for answers
-            radio_group = QButtonGroup(question_group)
-            
-            for i, option in enumerate(options):
-                radio = QRadioButton(option)
-                radio_group.addButton(radio, i)
-                q_layout.addWidget(radio)
-            
-            questions_layout.addWidget(question_group)
-            questions_layout.addWidget(QLabel(""))  # Spacer
-            
-            # Store the radio group for later retrieval of answers
-            user_answers[q_id] = radio_group
-        
-        scroll.setWidget(scroll_content)
-        layout.addWidget(scroll)
-        
-        submit_button = QPushButton("Submit Answers")
-        submit_button.clicked.connect(lambda: self.submit_quiz_answers(dialog, quiz_id, questions, user_answers))
-        layout.addWidget(submit_button)
-        
-        dialog.setLayout(layout)
+        dialog = GestureQuizDialog(self.user_id, quiz_id, quiz_title, self)
         dialog.exec_()
+        self.load_quizzes()
     
-    def submit_quiz_answers(self, dialog, quiz_id, questions, user_answers):
-        score = 0
-        total_questions = len(questions)
-        
-        # Calculate score
-        for q_id, question_text, options_json, correct_answer in questions:
-            radio_group = user_answers[q_id]
-            selected_answer = radio_group.checkedId()
-            
-            if selected_answer == correct_answer:
-                score += 1
-        
-        # Save result to database
+    def take_quiz(self, quiz_id):
+        # Standard quiz-taking function (without gestures)
+        QMessageBox.information(self, "Standard Quiz", 
+                               "Standard quiz mode is not implemented in this demo")
+    
+    def show_quiz_details(self, quiz_id):
         conn = get_db_connection()
         cursor = conn.cursor()
         
-        cursor.execute(
-            "INSERT INTO results (student_id, quiz_id, score, total_questions) VALUES (?, ?, ?, ?)",
-            (self.user_id, quiz_id, score, total_questions)
-        )
+        # Get quiz details
+        cursor.execute("SELECT title FROM quizzes WHERE id = ?", (quiz_id,))
+        quiz_title = cursor.fetchone()[0]
         
-        conn.commit()
+        # Get questions
+        cursor.execute("SELECT question_text, options, correct_answer FROM questions WHERE quiz_id = ?", (quiz_id,))
+        questions = cursor.fetchall()
+        
+        # Get results
+        cursor.execute("""
+            SELECT u.username, r.score, r.total_questions 
+            FROM results r 
+            JOIN users u ON r.student_id = u.id 
+            WHERE r.quiz_id = ? 
+            ORDER BY r.score DESC
+        """, (quiz_id,))
+        results = cursor.fetchall()
+        
         conn.close()
         
-        # Show result
-        QMessageBox.information(dialog, "Quiz Result", 
-                               f"Your score: {score}/{total_questions} ({score/total_questions*100:.1f}%)")
+        # Display quiz details
+        details = QDialog(self)
+        details.setWindowTitle(f"Quiz Details: {quiz_title}")
+        details.resize(600, 400)
         
-        dialog.accept()
+        layout = QVBoxLayout()
+        
+        # Quiz title
+        title_label = QLabel(quiz_title)
+        title_label.setFont(QFont("Arial", 16, QFont.Bold))
+        layout.addWidget(title_label)
+        
+        # Questions section
+        q_label = QLabel("Questions:")
+        q_label.setFont(QFont("Arial", 12, QFont.Bold))
+        layout.addWidget(q_label)
+        
+        for i, (question, options_json, correct) in enumerate(questions):
+            options = json.loads(options_json)
+            q_frame = QFrame()
+            q_frame.setFrameShape(QFrame.StyledPanel)
+            q_layout = QVBoxLayout(q_frame)
+            
+            q_text = QLabel(f"Q{i+1}: {question}")
+            q_text.setWordWrap(True)
+            q_layout.addWidget(q_text)
+            
+            for j, opt in enumerate(options):
+                opt_text = QLabel(f"  {chr(65+j)}. {opt}")
+                if j == correct:
+                    opt_text.setStyleSheet("color: green; font-weight: bold;")
+                q_layout.addWidget(opt_text)
+            
+            layout.addWidget(q_frame)
+        
+        # Results section
+        if results:
+            r_label = QLabel("Student Results:")
+            r_label.setFont(QFont("Arial", 12, QFont.Bold))
+            layout.addWidget(r_label)
+            
+            results_text = QTextEdit()
+            results_text.setReadOnly(True)
+            
+            results_str = ""
+            for username, score, total in results:
+                percentage = (score / total) * 100
+                results_str += f"{username}: {score}/{total} ({percentage:.1f}%)\n"
+            
+            results_text.setText(results_str)
+            layout.addWidget(results_text)
+        
+        close_button = QPushButton("Close")
+        close_button.clicked.connect(details.accept)
+        layout.addWidget(close_button)
+        
+        details.setLayout(layout)
+        details.exec_()
 
 class ResultsWidget(QWidget):
     def __init__(self, user_id, user_role, parent=None):
@@ -546,13 +886,17 @@ class ResultsWidget(QWidget):
         layout = QVBoxLayout()
         
         # Header
-        self.header_label = QLabel("Quiz Results")
+        if self.user_role == "teacher":
+            self.header_label = QLabel("Student Results")
+        else:
+            self.header_label = QLabel("My Quiz Results")
         self.header_label.setFont(QFont("Arial", 14, QFont.Bold))
         layout.addWidget(self.header_label)
         
-        # Results list
-        self.results_list = QListWidget()
-        layout.addWidget(self.results_list)
+        # Results display
+        self.results_text = QTextEdit()
+        self.results_text.setReadOnly(True)
+        layout.addWidget(self.results_text)
         
         # Refresh button
         self.refresh_button = QPushButton("Refresh Results")
@@ -563,27 +907,24 @@ class ResultsWidget(QWidget):
         self.load_results()
     
     def load_results(self):
-        self.results_list.clear()
-        
         conn = get_db_connection()
         cursor = conn.cursor()
         
         if self.user_role == "teacher":
             # Teachers see results for their quizzes
             cursor.execute("""
-                SELECT r.id, u.username, q.title, r.score, r.total_questions
+                SELECT q.title, u.username, r.score, r.total_questions, r.id
                 FROM results r
-                JOIN users u ON r.student_id = u.id
                 JOIN quizzes q ON r.quiz_id = q.id
+                JOIN users u ON r.student_id = u.id
                 WHERE q.teacher_id = ?
-                ORDER BY q.title, u.username
+                ORDER BY q.title, r.score DESC
             """, (self.user_id,))
         else:
             # Students see their own results
             cursor.execute("""
-                SELECT r.id, u.username, q.title, r.score, r.total_questions
+                SELECT q.title, r.score, r.total_questions, r.id
                 FROM results r
-                JOIN users u ON r.student_id = u.id
                 JOIN quizzes q ON r.quiz_id = q.id
                 WHERE r.student_id = ?
                 ORDER BY r.id DESC
@@ -592,62 +933,51 @@ class ResultsWidget(QWidget):
         results = cursor.fetchall()
         conn.close()
         
-        for result_id, username, quiz_title, score, total in results:
-            percentage = (score / total) * 100 if total > 0 else 0
-            item_text = f"{username}: {quiz_title} - {score}/{total} ({percentage:.1f}%)"
-            item = QListWidgetItem(item_text)
-            self.results_list.addItem(item)
-
-class HomeWidget(QWidget):
-    def __init__(self, username, user_role, parent=None):
-        super().__init__(parent)
-        self.username = username
-        self.user_role = user_role
-        self.initUI()
-    
-    def initUI(self):
-        layout = QVBoxLayout()
+        if not results:
+            self.results_text.setText("No results found.")
+            return
         
-        # Welcome message
-        welcome_label = QLabel(f"Welcome, {self.username}!")
-        welcome_label.setFont(QFont("Arial", 16, QFont.Bold))
-        layout.addWidget(welcome_label)
-        
-        role_label = QLabel(f"You are logged in as: {self.user_role.capitalize()}")
-        role_label.setFont(QFont("Arial", 12))
-        layout.addWidget(role_label)
-        
-        # Instructions
-        instructions = QLabel()
         if self.user_role == "teacher":
-            instructions.setText(
-                "As a teacher, you can:\n"
-                "• Create new quizzes\n"
-                "• View your existing quizzes\n"
-                "• See student results"
-            )
+            # Format results for teachers
+            text = ""
+            current_quiz = None
+            
+            for quiz_title, username, score, total, _ in results:
+                if quiz_title != current_quiz:
+                    if current_quiz:
+                        text += "\n\n"
+                    text += f"Quiz: {quiz_title}\n"
+                    text += "-" * 40 + "\n"
+                    current_quiz = quiz_title
+                
+                percentage = (score / total) * 100
+                text += f"{username}: {score}/{total} ({percentage:.1f}%)\n"
         else:
-            instructions.setText(
-                "As a student, you can:\n"
-                "• Take quizzes\n"
-                "• View your results"
-            )
-        instructions.setFont(QFont("Arial", 11))
-        layout.addWidget(instructions)
+            # Format results for students
+            text = ""
+            
+            for quiz_title, score, total, _ in results:
+                percentage = (score / total) * 100
+                text += f"Quiz: {quiz_title}\n"
+                text += f"Score: {score}/{total} ({percentage:.1f}%)\n"
+                
+                # Add performance assessment
+                if percentage >= 90:
+                    text += "Performance: Excellent!\n"
+                elif percentage >= 80:
+                    text += "Performance: Very Good\n"
+                elif percentage >= 70:
+                    text += "Performance: Good\n"
+                elif percentage >= 60:
+                    text += "Performance: Satisfactory\n"
+                else:
+                    text += "Performance: Needs Improvement\n"
+                
+                text += "-" * 40 + "\n\n"
         
-        # App description
-        description = QLabel(
-            "Gesture-Based MCQ Solver is an educational application designed to make "
-            "learning more interactive and engaging. Navigate through the sidebar "
-            "to access different features of the application."
-        )
-        description.setWordWrap(True)
-        layout.addWidget(description)
-        
-        layout.addStretch()
-        self.setLayout(layout)
+        self.results_text.setText(text)
 
-class SettingsWidget(QWidget):
+class HelpWidget(QWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
         self.initUI()
@@ -655,123 +985,124 @@ class SettingsWidget(QWidget):
     def initUI(self):
         layout = QVBoxLayout()
         
-        # Header
-        self.header_label = QLabel("Settings")
-        self.header_label.setFont(QFont("Arial", 14, QFont.Bold))
-        layout.addWidget(self.header_label)
+        # Title
+        title = QLabel("Gestura - Hand Gesture Quiz System")
+        title.setFont(QFont("Arial", 16, QFont.Bold))
+        layout.addWidget(title)
         
-        # Settings (placeholder)
-        layout.addWidget(QLabel("Settings options will be implemented in future versions."))
+        # Instructions text
+        help_text = QTextEdit()
+        help_text.setReadOnly(True)
+        help_text.setHtml("""
+        <h2>Using Gestura</h2>
+        
+        <h3>For Students:</h3>
+        <ul>
+            <li><b>Taking Quizzes:</b> Double-click on a quiz in the Quiz tab to begin.</li>
+            <li><b>Gesture Control:</b> When taking a quiz in gesture mode, hold up fingers to select answers:
+                <ul>
+                    <li>1 finger (index) = Option A</li>
+                    <li>2 fingers (index + middle) = Option B</li>
+                    <li>3 fingers = Option C</li>
+                    <li>4 fingers = Option D</li>
+                </ul>
+            </li>
+            <li><b>View Results:</b> Check your performance in the Results tab.</li>
+        </ul>
+        
+        <h3>For Teachers:</h3>
+        <ul>
+            <li><b>Create Quizzes:</b> Click "Create New Quiz" in the Quiz tab.</li>
+            <li><b>View Quiz Details:</b> Double-click on your quiz to see questions and student results.</li>
+            <li><b>Monitor Performance:</b> See all student results in the Results tab.</li>
+        </ul>
+        
+        <h3>Hand Gesture Tips:</h3>
+        <ul>
+            <li>Ensure good lighting for better gesture recognition.</li>
+            <li>Hold your hand clearly in the camera's view.</li>
+            <li>Keep fingers straight and clearly separated.</li>
+            <li>Hold the gesture for 1-2 seconds to register.</li>
+            <li>After a gesture is recognized, there's a 2-second cooldown.</li>
+        </ul>
+        """)
+        layout.addWidget(help_text)
         
         self.setLayout(layout)
 
-class GestureMCQApp(QMainWindow):
+class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
+        self.setWindowTitle("Gestura")
+        self.setWindowIcon(QIcon("icon.png"))
+        self.resize(800, 600)
         self.user_id = None
         self.user_role = None
         self.username = None
+        
+        # Initialize database
         initialize_database()
-        self.initUI()
-    
-    def initUI(self):
-        self.setWindowTitle("Gesture-Based MCQ Solver")
-        self.setGeometry(100, 100, 800, 600)
-        
-        # Create main layout with sidebar and content area
-        main_widget = QWidget()
-        main_layout = QHBoxLayout(main_widget)
-        
-        # Create sidebar
-        self.sidebar = QListWidget()
-        self.sidebar.setMaximumWidth(200)
-        self.sidebar.setFont(QFont("Arial", 12))
-        main_layout.addWidget(self.sidebar)
-        
-        # Create stacked widget for content
-        self.stacked_widget = QStackedWidget()
-        main_layout.addWidget(self.stacked_widget)
-        
-        self.setCentralWidget(main_widget)
         
         # Show login dialog
-        self.show_login_dialog()
+        self.show_login()
     
-    def show_login_dialog(self):
-        login_dialog = LoginDialog(self)
-        if login_dialog.exec() == QDialog.Accepted:
-            self.setup_ui_after_login()
+    def show_login(self):
+        dialog = LoginDialog(self)
+        result = dialog.exec_()
+        
+        if result == QDialog.Accepted:
+            self.setup_main_ui()
         else:
-            # If login was canceled and we're not logged in, exit the app
-            if not self.user_id:
-                sys.exit()
+            # Exit if login is cancelled
+            sys.exit()
     
-    def setup_ui_after_login(self):
-        # Clear sidebar and stacked widget
-        self.sidebar.clear()
-        for i in range(self.stacked_widget.count()):
-            self.stacked_widget.removeWidget(self.stacked_widget.widget(0))
+    def setup_main_ui(self):
+        # Update window title to show logged in user
+        self.setWindowTitle(f"Gestura - Logged in as {self.username} ({self.user_role})")
         
-        # Add sidebar items
-        self.sidebar.addItem("Home")
-        self.sidebar.addItem("Quizzes")
-        self.sidebar.addItem("Results")
-        self.sidebar.addItem("Settings")
+        # Create central widget with tabs
+        self.central_widget = QWidget()
+        self.setCentralWidget(self.central_widget)
         
-        if self.user_role == "teacher":
-            self.sidebar.addItem("Create Quiz")
+        main_layout = QVBoxLayout(self.central_widget)
         
-        self.sidebar.addItem("Sign Out")
+        # Create tab widget
+        self.tabs = QTabWidget()
         
-        # Connect sidebar click event
-        self.sidebar.currentRowChanged.connect(self.on_sidebar_change)
+        # Create quiz tab
+        self.quiz_tab = QuizWidget(self.user_id, self.user_role)
+        self.tabs.addTab(self.quiz_tab, "Quizzes")
         
-        # Add widgets to stacked widget
-        self.home_widget = HomeWidget(self.username, self.user_role)
-        self.stacked_widget.addWidget(self.home_widget)
+        # Create results tab
+        self.results_tab = ResultsWidget(self.user_id, self.user_role)
+        self.tabs.addTab(self.results_tab, "Results")
         
-        self.quiz_widget = QuizWidget(self.user_id, self.user_role)
-        self.stacked_widget.addWidget(self.quiz_widget)
+        # Create help tab
+        self.help_tab = HelpWidget()
+        self.tabs.addTab(self.help_tab, "Help")
         
-        self.results_widget = ResultsWidget(self.user_id, self.user_role)
-        self.stacked_widget.addWidget(self.results_widget)
+        main_layout.addWidget(self.tabs)
         
-        self.settings_widget = SettingsWidget()
-        self.stacked_widget.addWidget(self.settings_widget)
-        
-        if self.user_role == "teacher":
-            self.create_quiz_widget = QWidget()
-            create_layout = QVBoxLayout(self.create_quiz_widget)
-            create_button = QPushButton("Create New Quiz")
-            create_button.clicked.connect(self.on_create_quiz)
-            create_layout.addWidget(create_button)
-            create_layout.addStretch()
-            self.stacked_widget.addWidget(self.create_quiz_widget)
-        
-        # Set default widget
-        self.sidebar.setCurrentRow(0)
+        # Create logout button
+        self.logout_button = QPushButton("Logout")
+        self.logout_button.clicked.connect(self.logout)
+        main_layout.addWidget(self.logout_button)
     
-    def on_sidebar_change(self, index):
-        if index < self.stacked_widget.count():
-            if self.sidebar.item(index).text() == "Sign Out":
-                self.sign_out()
-            else:
-                self.stacked_widget.setCurrentIndex(index)
-    
-    def on_create_quiz(self):
-        dialog = CreateQuizDialog(self.user_id, self)
-        if dialog.exec() == QDialog.Accepted:
-            # Refresh quiz list after creating a new quiz
-            self.quiz_widget.load_quizzes()
-    
-    def sign_out(self):
+    def logout(self):
+        # Reset user info
         self.user_id = None
         self.user_role = None
         self.username = None
-        self.show_login_dialog()
+        
+        # Clear central widget
+        self.central_widget.setParent(None)
+        self.central_widget = None
+        
+        # Show login dialog again
+        self.show_login()
 
 if __name__ == "__main__":
     app = QApplication(sys.argv)
-    window = GestureMCQApp()
+    window = MainWindow()
     window.show()
     sys.exit(app.exec_())
